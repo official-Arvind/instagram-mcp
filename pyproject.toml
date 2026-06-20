@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instagram-mcp-server"
+version = "1.0.0"
+description = "MCP Server for full Instagram account control via AI agents — 68+ tools built with FastMCP + instagrapi"
+readme = "README.md"
+license = "MIT"
+authors = [
+  { name = "official-Arvind", email = "stararvindgaming@gmail.com" }
+]
+keywords = [
+  "instagram", "mcp", "model-context-protocol", "ai", "automation",
+  "fastmcp", "instagrapi", "claude", "cursor", "social-media"
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Internet :: WWW/HTTP",
+]
+requires-python = ">=3.10"
+dependencies = [
+  "fastmcp>=3.0.0",
+  "instagrapi>=2.1.0",
+  "pillow>=10.0.0",
+  "requests>=2.31.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/official-Arvind/instagram-mcp"
+Repository = "https://github.com/official-Arvind/instagram-mcp"
+Issues = "https://github.com/official-Arvind/instagram-mcp/issues"
+
+[project.scripts]
+instagram-mcp = "instagram_mcp_server.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["instagram_mcp_server*"]
+
+[tool.setuptools.package-data]
+instagram_mcp_server = ["py.typed"]
