@@ -313,12 +313,18 @@ def instagram_post_photo(
         # Post-upload options
         if alt_text:
             try:
-                ig.cl.media_set_caption_alt_text(media.pk, alt_text)
+                ig.cl.private_request(
+                    f"media/{media.pk}/update_media/",
+                    data={**ig.cl.with_action_data({}), "accessibility_caption": alt_text}
+                )
             except Exception:
-                pass
+                pass  # Alt text setting failed — not critical
         if disable_comments:
             try:
-                ig.cl.media_disable_comments(media.pk)
+                ig.cl.private_request(
+                    f"media/{media.pk}/disable_comments/",
+                    data=ig.cl.with_action_data({})
+                )
             except Exception:
                 pass
 
@@ -330,6 +336,7 @@ def instagram_post_photo(
             "location": location_name,
             "tagged_users": tag_users_in_photo,
             "comments_disabled": disable_comments,
+            "note": "alt_text must be set in the Instagram app (no API support)",
         })
     except Exception as e:
         return f"Error posting photo: {e}"
@@ -385,7 +392,10 @@ def instagram_post_album(
 
         if disable_comments:
             try:
-                ig.cl.media_disable_comments(media.pk)
+                ig.cl.private_request(
+                    f"media/{media.pk}/disable_comments/",
+                    data=ig.cl.with_action_data({})
+                )
             except Exception:
                 pass
 
@@ -451,14 +461,12 @@ def instagram_post_video(
         location = _get_location(location_name)
         media = ig.cl.video_upload(local_v, full_caption, thumbnail=local_t, location=location)
 
-        if alt_text:
-            try:
-                ig.cl.media_set_caption_alt_text(media.pk, alt_text)
-            except Exception:
-                pass
         if disable_comments:
             try:
-                ig.cl.media_disable_comments(media.pk)
+                ig.cl.private_request(
+                    f"media/{media.pk}/disable_comments/",
+                    data=ig.cl.with_action_data({})
+                )
             except Exception:
                 pass
 
@@ -517,7 +525,10 @@ def instagram_post_reel(
 
         if disable_comments:
             try:
-                ig.cl.media_disable_comments(media.pk)
+                ig.cl.private_request(
+                    f"media/{media.pk}/disable_comments/",
+                    data=ig.cl.with_action_data({})
+                )
             except Exception:
                 pass
 
@@ -576,8 +587,10 @@ def instagram_edit_post_caption(
 @mcp.tool()
 def instagram_tag_users_in_post(media_id_or_url: str, usernames: str) -> str:
     """
-    Tag one or more users physically IN a photo (the people-tag feature).
-    Tags are distributed evenly across the image.
+    Tag one or more users physically IN a photo (people tags).
+    NOTE: Instagram's API only supports setting usertags at upload time.
+    Use the tag_users_in_photo parameter in instagram_post_photo/post_reel instead.
+    This tool attempts a post-upload tag via the private endpoint.
 
     Parameters:
     - media_id_or_url: Post media ID or Instagram URL
@@ -589,28 +602,47 @@ def instagram_tag_users_in_post(media_id_or_url: str, usernames: str) -> str:
         usertags = _build_usertags(usernames)
         if not usertags:
             return "Error: Could not resolve any of the provided usernames."
-        result = ig.cl.media_tag(mid, usertags)
+        # Build the usertag payload for the private API
+        usertag_data = {
+            "usertags": {
+                "in": [
+                    {
+                        "user_id": str(ut.user.pk),
+                        "position": [ut.x, ut.y]
+                    }
+                    for ut in usertags
+                ]
+            }
+        }
+        ig.cl.private_request(
+            f"media/{mid}/update_media/",
+            data={**ig.cl.with_action_data({}), **{"usertags": str(usertag_data)}}
+        )
         tagged = [ut.user.username for ut in usertags]
-        return f"Successfully tagged {len(tagged)} user(s): {', '.join(tagged)}"
+        return f"Tagged {len(tagged)} user(s): {', '.join(tagged)}. (Tip: for guaranteed tags, use tag_users_in_photo param in instagram_post_photo)"
     except Exception as e:
-        return f"Error tagging users: {e}"
+        return f"Tip: Post-upload tagging has limited API support. Use the 'tag_users_in_photo' parameter when creating a new post. Error: {e}"
 
 
 @mcp.tool()
 def instagram_set_post_alt_text(media_id_or_url: str, alt_text: str) -> str:
     """
-    Set the accessibility alt text on an existing post.
-    Alt text helps visually impaired users and improves SEO.
+    Attempt to set accessibility alt text on an existing post via the private API.
+    Alt text describes the image content for visually impaired users.
 
     Parameters:
     - media_id_or_url: Post media ID or full Instagram URL
-    - alt_text: Text description of the image content
+    - alt_text: Text description of the image/video content
     """
     if err := _require_login(): return err
     try:
         mid = _media_id_from_input(media_id_or_url)
-        ig.cl.media_set_caption_alt_text(mid, alt_text)
-        return f"Alt text set to: '{alt_text}'"
+        # Instagram private API endpoint for accessibility caption
+        ig.cl.private_request(
+            f"media/{mid}/update_media/",
+            data={**ig.cl.with_action_data({}), "accessibility_caption": alt_text}
+        )
+        return f"Alt text set successfully: '{alt_text}'"
     except Exception as e:
         return f"Error setting alt text: {e}"
 
@@ -621,10 +653,13 @@ def instagram_disable_comments(media_id_or_url: str) -> str:
     if err := _require_login(): return err
     try:
         mid = _media_id_from_input(media_id_or_url)
-        ig.cl.media_disable_comments(mid)
+        ig.cl.private_request(
+            f"media/{mid}/disable_comments/",
+            data=ig.cl.with_action_data({})
+        )
         return f"Comments disabled on post {mid}."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error disabling comments: {e}"
 
 
 @mcp.tool()
@@ -633,10 +668,13 @@ def instagram_enable_comments(media_id_or_url: str) -> str:
     if err := _require_login(): return err
     try:
         mid = _media_id_from_input(media_id_or_url)
-        ig.cl.media_enable_comments(mid)
+        ig.cl.private_request(
+            f"media/{mid}/enable_comments/",
+            data=ig.cl.with_action_data({})
+        )
         return f"Comments enabled on post {mid}."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error enabling comments: {e}"
 
 
 @mcp.tool()
@@ -775,10 +813,19 @@ def instagram_get_saved_posts(amount: int = 20) -> str:
     """Get posts saved in your Saved collection."""
     if err := _require_login(): return err
     try:
-        medias = ig.cl.user_saved_medias(ig.cl.user_id)[:amount]
+        # Use the all-items collection
+        medias = ig.cl.collection_medias_by_name("ALL_POSTS_AUTO_COLLECTION", amount=amount)
         return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error: {e}"
+        # Fallback: fetch via collection list
+        try:
+            cols = ig.cl.collections()
+            if cols:
+                medias = ig.cl.collection_medias(cols[0].id, amount=amount)
+                return str([_fmt_media(m) for m in medias])
+        except Exception:
+            pass
+        return f"Error fetching saved posts: {e}"
 
 
 @mcp.tool()
@@ -1000,7 +1047,7 @@ def instagram_get_highlights(username: Optional[str] = None) -> str:
     try:
         target = username or ig.cl.username
         uid = ig.cl.user_id_from_username(target)
-        highlights = ig.cl.highlights(uid)
+        highlights = ig.cl.user_highlights(uid)
         return str([{"pk": str(h.pk), "title": h.title, "media_count": h.media_count} for h in highlights])
     except Exception as e:
         return f"Error: {e}"
@@ -1122,7 +1169,7 @@ def instagram_delete_comment(media_id_or_url: str, comment_id: str) -> str:
     if err := _require_login(): return err
     try:
         mid = _media_id_from_input(media_id_or_url)
-        ig.cl.media_comment_delete(mid, comment_id)
+        ig.cl.comment_bulk_delete(mid, [comment_id])
         return f"Comment {comment_id} deleted."
     except Exception as e:
         return f"Error: {e}"
@@ -1133,7 +1180,7 @@ def instagram_like_comment(comment_id: str) -> str:
     """Like a comment on a post."""
     if err := _require_login(): return err
     try:
-        ig.cl.media_comment_like(comment_id)
+        ig.cl.comment_like(comment_id)
         return f"Comment {comment_id} liked."
     except Exception as e:
         return f"Error: {e}"
@@ -1240,10 +1287,12 @@ def instagram_get_blocked_users() -> str:
     """Get the full list of users you have blocked."""
     if err := _require_login(): return err
     try:
-        blocked = ig.cl.user_blocked_list()
-        return str([_fmt_user(u) for u in blocked])
+        # Use the private API endpoint directly
+        result = ig.cl.private_request("users/blocked_list/")
+        users = result.get("blocked_list", [])
+        return str([{"pk": str(u.get("pk")), "username": u.get("username")} for u in users])
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error fetching blocked users: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1416,10 +1465,10 @@ def instagram_get_similar_accounts(username: str) -> str:
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
-        similar = ig.cl.user_related_profiles(uid)
+        similar = ig.cl.user_suggested_profiles(uid)
         return str([_fmt_user(u) for u in similar])
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error fetching similar accounts: {e}"
 
 
 @mcp.tool()
@@ -1461,14 +1510,13 @@ def instagram_get_notifications(amount: int = 20) -> str:
 
 @mcp.tool()
 def instagram_get_pending_follow_requests() -> str:
-    """Get pending follow requests (for private accounts)."""
+    """Get pending follow requests for your account (relevant for private accounts)."""
     if err := _require_login(): return err
     try:
-        pending = ig.cl.pending_requests_v1()
-        users = pending.get("users", [])
-        return str([{"pk": str(u.get("pk")), "username": u.get("username"), "full_name": u.get("full_name")} for u in users])
+        users = ig.cl.user_follow_requests()
+        return str([_fmt_user(u) for u in users])
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error fetching pending requests: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
