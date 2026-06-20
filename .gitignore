@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyc
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Instagram Session (NEVER commit this - contains your login tokens!)
+instagram_session.json
+*.json
+!package.json
+
+# Temp / uploaded / downloaded media files
+*.tmp
+temp_*
+downloads/
+
+# Test images
+test_post.png
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Dist / Build
+dist/
+build/
+*.egg-info/
+
+# Env files (may contain secrets)
+.env
+.env.*
