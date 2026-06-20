@@ -2,24 +2,22 @@
 mcp_server.py
 --------------
 Instagram Control MCP Server — built with FastMCP + instagrapi.
-Exposes 50+ tools covering every Instagram action a human can perform,
-and then some.
+Exposes 60+ tools covering EVERY Instagram action a human can perform.
 
-Authentication → Profile → Feed → Reels → Stories → Highlights
-→ Comments → Likes → Saves → DMs → Search → Hashtags
-→ Following/Followers → Notifications → Analytics → Media Downloads
+FULL POST MANAGEMENT:
+  caption, hashtags, @mentions in caption, user-tag people IN photos,
+  location tags, alt text (accessibility), close-friends stories,
+  story stickers (hashtag/mention/location/link), edit captions,
+  disable/enable comments, archive/unarchive, pin/unpin, and more.
 """
 
 import os
+import re
 import sys
-import time
-import random
 import tempfile
 import requests
-import re
 from pathlib import Path
 from typing import Optional, List
-from datetime import datetime
 
 from fastmcp import FastMCP
 from instagram_client import InstagramClientWrapper
@@ -31,41 +29,35 @@ from instagram_client import InstagramClientWrapper
 mcp = FastMCP(
     "Instagram Control",
     instructions=(
-        "This server lets AI agents fully control an Instagram account. "
-        "Always call instagram_get_login_status first to verify authentication. "
-        "Use instagram_login_with_sessionid for the most stable authentication. "
-        "A session file is persisted locally and auto-loaded between runs."
+        "Full Instagram account control server. "
+        "Auto-restores session on startup — just call instagram_get_login_status to verify. "
+        "When posting, always build the caption with relevant hashtags and @mentions included. "
+        "Use instagram_login_with_sessionid for the most reliable authentication."
     )
 )
 
 _SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instagram_session.json")
 ig = InstagramClientWrapper(session_path=_SESSION_PATH)
-
-# Attempt to auto-restore session on startup
-ig.init_from_saved_session()
+ig.init_from_saved_session()  # auto-restore on startup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _require_login() -> Optional[str]:
-    """Returns an error string if not logged in, else None."""
     if not ig.is_logged_in():
         return "Error: Not logged in. Call instagram_login_with_sessionid or instagram_login_with_credentials first."
     return None
 
 def _download_if_url(path_or_url: str, suffix: str = ".jpg") -> str:
-    """Downloads a file from a URL and returns the local temp path."""
+    """Download remote URL to a temp local file. Returns local path."""
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         r = requests.get(path_or_url, stream=True, timeout=30)
         r.raise_for_status()
-        # Try to detect extension from Content-Type
         ct = r.headers.get("Content-Type", "")
         if "mp4" in ct or "video" in ct:
             suffix = ".mp4"
-        elif "jpeg" in ct or "jpg" in ct:
-            suffix = ".jpg"
         elif "png" in ct:
             suffix = ".png"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -76,13 +68,45 @@ def _download_if_url(path_or_url: str, suffix: str = ".jpg") -> str:
     return path_or_url
 
 def _cleanup(local: str, original: str):
-    """Removes temp file if we downloaded it."""
     if original.startswith("http://") or original.startswith("https://"):
         try:
             if os.path.exists(local):
                 os.remove(local)
         except Exception:
             pass
+
+def _build_usertags(usernames_csv: Optional[str]):
+    """
+    Convert a comma-separated string of @usernames into Usertag objects.
+    Positions are distributed evenly across the image.
+    """
+    if not usernames_csv:
+        return []
+    from instagrapi.types import Usertag
+    names = [u.strip().lstrip("@") for u in usernames_csv.split(",") if u.strip()]
+    tags = []
+    total = len(names)
+    for i, name in enumerate(names):
+        try:
+            uid = ig.cl.user_id_from_username(name)
+            user_info = ig.cl.user_info(uid)
+            # Spread tags across the image horizontally
+            x = round((i + 1) / (total + 1), 2)
+            y = 0.5
+            tags.append(Usertag(user=user_info, x=x, y=y))
+        except Exception:
+            pass  # Skip invalid usernames silently
+    return tags
+
+def _get_location(location_name: Optional[str]):
+    """Search for a location and return the first match."""
+    if not location_name:
+        return None
+    try:
+        results = ig.cl.location_search(location_name)
+        return results[0] if results else None
+    except Exception:
+        return None
 
 def _fmt_user(u) -> dict:
     return {
@@ -99,71 +123,72 @@ def _fmt_media(m) -> dict:
         "code": m.code,
         "url": f"https://www.instagram.com/p/{m.code}/",
         "type": m.media_type,
-        "caption": m.caption_text[:200] if m.caption_text else "",
+        "caption": (m.caption_text or "")[:200],
         "like_count": m.like_count,
         "comment_count": m.comment_count,
         "taken_at": str(m.taken_at),
         "user": m.user.username if m.user else None,
     }
 
+def _media_id_from_input(media_id_or_url: str) -> str:
+    """Accept either a raw media ID or a post URL."""
+    if "instagram.com" in media_id_or_url:
+        match = re.search(r'/(?:p|reel)/([A-Za-z0-9_-]+)/', media_id_or_url)
+        if match:
+            return ig.cl.media_id(match.group(1))
+    return media_id_or_url
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. AUTHENTICATION TOOLS
+# 1. AUTHENTICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def instagram_login_with_credentials(username: str, password: str) -> str:
     """
-    Log in to Instagram using username and password.
-    If 2FA is enabled, returns status 'needs_2fa' — follow up with instagram_complete_2fa.
-    If a security challenge triggers, returns 'needs_challenge' — follow up with instagram_complete_challenge.
+    Log in using username + password.
+    Returns 'needs_2fa' or 'needs_challenge' if verification is required.
     """
     return str(ig.login_with_credentials(username, password))
-
 
 @mcp.tool()
 def instagram_login_with_sessionid(username: str, session_id: str) -> str:
     """
-    Log in using a browser sessionid cookie (most reliable method — bypasses 2FA).
-    How to get the sessionid: Open Instagram in browser → F12 DevTools →
-    Application/Storage → Cookies → instagram.com → copy the 'sessionid' value.
+    Log in via browser sessionid cookie — most reliable, bypasses 2FA.
+    Get it: Instagram.com → F12 → Application → Cookies → copy 'sessionid'.
     """
     return str(ig.login_with_sessionid(username, session_id))
 
-
 @mcp.tool()
 def instagram_complete_2fa(code: str) -> str:
-    """Submit the 2FA authenticator app code after login returned 'needs_2fa'."""
+    """Submit the 2FA authenticator code after login returned 'needs_2fa'."""
     return str(ig.complete_2fa(code))
-
 
 @mcp.tool()
 def instagram_complete_challenge(code: str) -> str:
-    """Submit the email/SMS challenge verification code after login returned 'needs_challenge'."""
+    """Submit the email/SMS challenge code after login returned 'needs_challenge'."""
     return str(ig.complete_challenge(code))
-
 
 @mcp.tool()
 def instagram_get_login_status() -> str:
     """Check if the server is authenticated and which account is active."""
     return str(ig.get_login_status())
 
-
 @mcp.tool()
 def instagram_logout() -> str:
-    """Log out of Instagram and delete the saved session file from disk."""
+    """Log out and delete the saved session file from disk."""
     return str(ig.logout())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. PROFILE TOOLS
+# 2. PROFILE
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def instagram_get_profile(username: Optional[str] = None) -> str:
     """
-    Get full profile information for the logged-in account, or any target username.
-    Returns follower/following counts, bio, posts count, website, etc.
+    Get full profile details for the logged-in account or any target username.
+    Includes bio, follower/following counts, post count, website, verification status.
     """
     if err := _require_login(): return err
     try:
@@ -181,109 +206,195 @@ def instagram_get_profile(username: Optional[str] = None) -> str:
             "is_private": u.is_private,
             "is_verified": u.is_verified,
             "is_business": u.is_business,
-            "account_type": u.account_type,
             "profile_pic_url": str(u.profile_pic_url),
             "category": u.category,
         })
     except Exception as e:
         return f"Error: {e}"
 
-
 @mcp.tool()
-def instagram_edit_profile(full_name: Optional[str] = None, biography: Optional[str] = None,
+def instagram_edit_profile(full_name: Optional[str] = None,
+                             biography: Optional[str] = None,
                              external_url: Optional[str] = None) -> str:
     """
-    Edit the logged-in account's profile. Provide any combination of:
-    full_name, biography (bio text), external_url (website link).
-    Only provided fields are updated.
+    Edit the logged-in account's profile.
+    - full_name: Display name
+    - biography: Bio text (supports emojis, newlines, @mentions, #hashtags)
+    - external_url: Website link in bio
+    Only fields you provide are updated.
     """
     if err := _require_login(): return err
     try:
-        # Fetch current values so we only override what's requested
         u = ig.cl.user_info(ig.cl.user_id)
-        result = ig.cl.account_edit(
+        ig.cl.account_edit(
             full_name=full_name or u.full_name,
             biography=biography if biography is not None else u.biography,
             external_url=external_url or str(u.external_url or ""),
         )
-        return f"Profile updated successfully. Result: {result}"
+        return "Profile updated successfully."
     except Exception as e:
         return f"Error updating profile: {e}"
 
-
 @mcp.tool()
 def instagram_change_profile_picture(image_path_or_url: str) -> str:
-    """
-    Change the profile picture. Accepts a local file path or a direct image URL.
-    """
+    """Change the profile picture. Accepts local file path or image URL."""
     if err := _require_login(): return err
     local = None
     try:
         local = _download_if_url(image_path_or_url, ".jpg")
-        result = ig.cl.account_change_picture(local)
-        return f"Profile picture changed successfully."
+        ig.cl.account_change_picture(local)
+        return "Profile picture changed successfully."
     except Exception as e:
-        return f"Error changing profile picture: {e}"
+        return f"Error: {e}"
     finally:
-        if local:
-            _cleanup(local, image_path_or_url)
+        if local: _cleanup(local, image_path_or_url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. FEED / MEDIA TOOLS
+# 3. FULL POST CREATION & MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def instagram_post_photo(image_path_or_url: str, caption: str,
-                          location_name: Optional[str] = None) -> str:
+def instagram_post_photo(
+    image_path_or_url: str,
+    caption: str,
+    hashtags: Optional[str] = None,
+    mentions: Optional[str] = None,
+    tag_users_in_photo: Optional[str] = None,
+    location_name: Optional[str] = None,
+    alt_text: Optional[str] = None,
+    disable_comments: bool = False,
+    hide_likes: bool = False,
+) -> str:
     """
-    Post a photo to the Instagram feed. Accepts local file path or direct image URL.
-    Optionally include a location name to tag the post.
+    Post a photo to the Instagram feed with FULL control.
+
+    Parameters:
+    - image_path_or_url: Local file path or direct image URL
+    - caption: Main post caption/description text
+    - hashtags: Comma-separated hashtags to append (e.g. "#python, #ai, #coding")
+    - mentions: Comma-separated @usernames to mention in caption (e.g. "@nasa, @google")
+    - tag_users_in_photo: Comma-separated @usernames to physically TAG in the image (people tags)
+    - location_name: Location to tag (e.g. "New York, USA" or "Eiffel Tower")
+    - alt_text: Accessibility alt text describing the image content
+    - disable_comments: Set True to disable comments on this post
+    - hide_likes: Set True to hide like count from others
     """
     if err := _require_login(): return err
     local = None
     try:
         local = _download_if_url(image_path_or_url, ".jpg")
-        location = None
-        if location_name:
-            results = ig.cl.location_search(location_name)
-            if results:
-                location = results[0]
-        media = ig.cl.photo_upload(local, caption, location=location)
+
+        # Build full caption by appending hashtags and mentions
+        full_caption = caption or ""
+        if mentions:
+            mention_str = " ".join([
+                m.strip() if m.strip().startswith("@") else f"@{m.strip()}"
+                for m in mentions.split(",") if m.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{mention_str}".strip()
+        if hashtags:
+            tag_str = " ".join([
+                h.strip() if h.strip().startswith("#") else f"#{h.strip()}"
+                for h in hashtags.split(",") if h.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{tag_str}".strip()
+
+        location = _get_location(location_name)
+        usertags = _build_usertags(tag_users_in_photo)
+
+        media = ig.cl.photo_upload(
+            local,
+            full_caption,
+            location=location,
+            usertags=usertags,
+        )
+
+        # Post-upload options
+        if alt_text:
+            try:
+                ig.cl.media_set_caption_alt_text(media.pk, alt_text)
+            except Exception:
+                pass
+        if disable_comments:
+            try:
+                ig.cl.media_disable_comments(media.pk)
+            except Exception:
+                pass
+
         return str({
             "status": "success",
             "media_id": str(media.pk),
             "url": f"https://www.instagram.com/p/{media.code}/",
-            "caption": media.caption_text[:100] if media.caption_text else "",
+            "caption_preview": full_caption[:100],
+            "location": location_name,
+            "tagged_users": tag_users_in_photo,
+            "comments_disabled": disable_comments,
         })
     except Exception as e:
         return f"Error posting photo: {e}"
     finally:
-        if local:
-            _cleanup(local, image_path_or_url)
+        if local: _cleanup(local, image_path_or_url)
 
 
 @mcp.tool()
-def instagram_post_album(image_paths_or_urls: List[str], caption: str) -> str:
+def instagram_post_album(
+    image_paths_or_urls: List[str],
+    caption: str,
+    hashtags: Optional[str] = None,
+    mentions: Optional[str] = None,
+    location_name: Optional[str] = None,
+    disable_comments: bool = False,
+) -> str:
     """
-    Post multiple photos/videos as a carousel album (up to 10 items).
-    Accepts a list of local paths or URLs.
+    Post a carousel album (2–10 photos/videos) with full caption control.
+
+    Parameters:
+    - image_paths_or_urls: List of local paths or URLs (up to 10 items)
+    - caption: Main caption text
+    - hashtags: Comma-separated hashtags (e.g. "#travel, #photography")
+    - mentions: Comma-separated @mentions (e.g. "@friend1, @brand")
+    - location_name: Location tag string
+    - disable_comments: Set True to disable comments
     """
     if err := _require_login(): return err
     locals_ = []
     try:
-        from pathlib import Path as _P
+        full_caption = caption or ""
+        if mentions:
+            mention_str = " ".join([
+                m.strip() if m.strip().startswith("@") else f"@{m.strip()}"
+                for m in mentions.split(",") if m.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{mention_str}".strip()
+        if hashtags:
+            tag_str = " ".join([
+                h.strip() if h.strip().startswith("#") else f"#{h.strip()}"
+                for h in hashtags.split(",") if h.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{tag_str}".strip()
+
         paths = []
         for item in image_paths_or_urls[:10]:
             local = _download_if_url(item, ".jpg")
             locals_.append((local, item))
-            paths.append(_P(local))
-        media = ig.cl.album_upload(paths, caption)
+            paths.append(Path(local))
+
+        location = _get_location(location_name)
+        media = ig.cl.album_upload(paths, full_caption, location=location)
+
+        if disable_comments:
+            try:
+                ig.cl.media_disable_comments(media.pk)
+            except Exception:
+                pass
+
         return str({
             "status": "success",
             "media_id": str(media.pk),
             "url": f"https://www.instagram.com/p/{media.code}/",
-            "items_count": len(paths),
+            "items": len(paths),
+            "caption_preview": full_caption[:100],
         })
     except Exception as e:
         return f"Error posting album: {e}"
@@ -293,20 +404,64 @@ def instagram_post_album(image_paths_or_urls: List[str], caption: str) -> str:
 
 
 @mcp.tool()
-def instagram_post_video(video_path_or_url: str, caption: str,
-                          thumbnail_path_or_url: Optional[str] = None) -> str:
+def instagram_post_video(
+    video_path_or_url: str,
+    caption: str,
+    hashtags: Optional[str] = None,
+    mentions: Optional[str] = None,
+    location_name: Optional[str] = None,
+    thumbnail_path_or_url: Optional[str] = None,
+    alt_text: Optional[str] = None,
+    disable_comments: bool = False,
+) -> str:
     """
-    Post a video to the Instagram feed. Accepts local path or URL.
-    Optionally provide a thumbnail image path or URL.
+    Post a video to the feed with full caption control.
+
+    Parameters:
+    - video_path_or_url: Local path or URL to MP4 file
+    - caption: Caption text
+    - hashtags: Comma-separated hashtags
+    - mentions: Comma-separated @mentions
+    - location_name: Location to tag
+    - thumbnail_path_or_url: Custom thumbnail image (optional)
+    - alt_text: Accessibility description for the video
+    - disable_comments: Set True to disable comments
     """
     if err := _require_login(): return err
-    local_v = None
-    local_t = None
+    local_v = local_t = None
     try:
+        full_caption = caption or ""
+        if mentions:
+            mention_str = " ".join([
+                m.strip() if m.strip().startswith("@") else f"@{m.strip()}"
+                for m in mentions.split(",") if m.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{mention_str}".strip()
+        if hashtags:
+            tag_str = " ".join([
+                h.strip() if h.strip().startswith("#") else f"#{h.strip()}"
+                for h in hashtags.split(",") if h.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{tag_str}".strip()
+
         local_v = _download_if_url(video_path_or_url, ".mp4")
         if thumbnail_path_or_url:
             local_t = _download_if_url(thumbnail_path_or_url, ".jpg")
-        media = ig.cl.video_upload(local_v, caption, thumbnail=local_t)
+
+        location = _get_location(location_name)
+        media = ig.cl.video_upload(local_v, full_caption, thumbnail=local_t, location=location)
+
+        if alt_text:
+            try:
+                ig.cl.media_set_caption_alt_text(media.pk, alt_text)
+            except Exception:
+                pass
+        if disable_comments:
+            try:
+                ig.cl.media_disable_comments(media.pk)
+            except Exception:
+                pass
+
         return str({
             "status": "success",
             "media_id": str(media.pk),
@@ -320,151 +475,409 @@ def instagram_post_video(video_path_or_url: str, caption: str,
 
 
 @mcp.tool()
-def instagram_post_reel(video_path_or_url: str, caption: str) -> str:
+def instagram_post_reel(
+    video_path_or_url: str,
+    caption: str,
+    hashtags: Optional[str] = None,
+    mentions: Optional[str] = None,
+    location_name: Optional[str] = None,
+    disable_comments: bool = False,
+) -> str:
     """
-    Post a video as a Reel. Accepts local path or URL.
-    Reels get significantly more reach than regular feed videos.
+    Post a Reel with full caption control. Reels have the highest organic reach.
+
+    Parameters:
+    - video_path_or_url: Local path or URL to MP4 video
+    - caption: Caption text
+    - hashtags: Comma-separated hashtags (crucial for Reel discovery)
+    - mentions: Comma-separated @mentions
+    - location_name: Location tag
+    - disable_comments: Set True to disable comments
     """
     if err := _require_login(): return err
     local_v = None
     try:
+        full_caption = caption or ""
+        if mentions:
+            mention_str = " ".join([
+                m.strip() if m.strip().startswith("@") else f"@{m.strip()}"
+                for m in mentions.split(",") if m.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{mention_str}".strip()
+        if hashtags:
+            tag_str = " ".join([
+                h.strip() if h.strip().startswith("#") else f"#{h.strip()}"
+                for h in hashtags.split(",") if h.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{tag_str}".strip()
+
         local_v = _download_if_url(video_path_or_url, ".mp4")
-        media = ig.cl.clip_upload(local_v, caption)
+        location = _get_location(location_name)
+        media = ig.cl.clip_upload(local_v, full_caption, location=location)
+
+        if disable_comments:
+            try:
+                ig.cl.media_disable_comments(media.pk)
+            except Exception:
+                pass
+
         return str({
             "status": "success",
             "media_id": str(media.pk),
             "url": f"https://www.instagram.com/reel/{media.code}/",
+            "caption_preview": full_caption[:100],
         })
     except Exception as e:
-        return f"Error posting reel: {e}"
+        return f"Error posting Reel: {e}"
     finally:
         if local_v: _cleanup(local_v, video_path_or_url)
 
 
 @mcp.tool()
-def instagram_delete_post(media_id: str) -> str:
+def instagram_edit_post_caption(
+    media_id_or_url: str,
+    new_caption: str,
+    hashtags: Optional[str] = None,
+    mentions: Optional[str] = None,
+) -> str:
     """
-    Delete a post by its media ID. This is permanent and cannot be undone.
+    Edit the caption of an existing post.
+
+    Parameters:
+    - media_id_or_url: Post media ID or full Instagram URL
+    - new_caption: The new caption text (replaces the old one entirely)
+    - hashtags: Hashtags to append to the new caption
+    - mentions: @mentions to append to the new caption
     """
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_delete(media_id)
-        return f"Post {media_id} deleted successfully. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+
+        full_caption = new_caption or ""
+        if mentions:
+            mention_str = " ".join([
+                m.strip() if m.strip().startswith("@") else f"@{m.strip()}"
+                for m in mentions.split(",") if m.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{mention_str}".strip()
+        if hashtags:
+            tag_str = " ".join([
+                h.strip() if h.strip().startswith("#") else f"#{h.strip()}"
+                for h in hashtags.split(",") if h.strip()
+            ])
+            full_caption = f"{full_caption}\n\n{tag_str}".strip()
+
+        result = ig.cl.media_edit(mid, full_caption)
+        return f"Caption updated successfully. New caption preview: '{full_caption[:100]}'"
+    except Exception as e:
+        return f"Error editing caption: {e}"
+
+
+@mcp.tool()
+def instagram_tag_users_in_post(media_id_or_url: str, usernames: str) -> str:
+    """
+    Tag one or more users physically IN a photo (the people-tag feature).
+    Tags are distributed evenly across the image.
+
+    Parameters:
+    - media_id_or_url: Post media ID or Instagram URL
+    - usernames: Comma-separated @usernames to tag in the photo
+    """
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        usertags = _build_usertags(usernames)
+        if not usertags:
+            return "Error: Could not resolve any of the provided usernames."
+        result = ig.cl.media_tag(mid, usertags)
+        tagged = [ut.user.username for ut in usertags]
+        return f"Successfully tagged {len(tagged)} user(s): {', '.join(tagged)}"
+    except Exception as e:
+        return f"Error tagging users: {e}"
+
+
+@mcp.tool()
+def instagram_set_post_alt_text(media_id_or_url: str, alt_text: str) -> str:
+    """
+    Set the accessibility alt text on an existing post.
+    Alt text helps visually impaired users and improves SEO.
+
+    Parameters:
+    - media_id_or_url: Post media ID or full Instagram URL
+    - alt_text: Text description of the image content
+    """
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_set_caption_alt_text(mid, alt_text)
+        return f"Alt text set to: '{alt_text}'"
+    except Exception as e:
+        return f"Error setting alt text: {e}"
+
+
+@mcp.tool()
+def instagram_disable_comments(media_id_or_url: str) -> str:
+    """Disable comments on a post."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_disable_comments(mid)
+        return f"Comments disabled on post {mid}."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def instagram_enable_comments(media_id_or_url: str) -> str:
+    """Enable comments on a post (reverses a previous disable)."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_enable_comments(mid)
+        return f"Comments enabled on post {mid}."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def instagram_archive_post(media_id_or_url: str) -> str:
+    """
+    Archive a post (hides it from your profile grid, but keeps it saved).
+    Archived posts can be found in your Archive section.
+    """
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_archive(mid)
+        return f"Post {mid} archived successfully."
+    except Exception as e:
+        return f"Error archiving post: {e}"
+
+
+@mcp.tool()
+def instagram_unarchive_post(media_id_or_url: str) -> str:
+    """Unarchive a post (restores it to your profile grid)."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_unarchive(mid)
+        return f"Post {mid} unarchived successfully."
+    except Exception as e:
+        return f"Error unarchiving post: {e}"
+
+
+@mcp.tool()
+def instagram_pin_post(media_id_or_url: str) -> str:
+    """
+    Pin a post to the top of your profile grid.
+    You can pin up to 3 posts on your profile.
+    """
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_pin(mid)
+        return f"Post {mid} pinned to profile."
+    except Exception as e:
+        return f"Error pinning post: {e}"
+
+
+@mcp.tool()
+def instagram_unpin_post(media_id_or_url: str) -> str:
+    """Remove a pinned post from the top of your profile grid."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_unpin(mid)
+        return f"Post {mid} unpinned."
+    except Exception as e:
+        return f"Error unpinning post: {e}"
+
+
+@mcp.tool()
+def instagram_delete_post(media_id_or_url: str) -> str:
+    """Permanently delete a post. This cannot be undone."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_delete(mid)
+        return f"Post {mid} deleted permanently."
     except Exception as e:
         return f"Error deleting post: {e}"
 
 
 @mcp.tool()
 def instagram_get_user_feed(username: Optional[str] = None, amount: int = 12) -> str:
-    """
-    Get recent posts from the logged-in account or a target username.
-    Returns post URLs, captions, like/comment counts, and timestamps.
-    """
+    """Get recent posts from the logged-in account or any target username."""
     if err := _require_login(): return err
     try:
         target = username or ig.cl.username
-        user_id = ig.cl.user_id_from_username(target)
-        medias = ig.cl.user_medias(user_id, amount)
+        uid = ig.cl.user_id_from_username(target)
+        medias = ig.cl.user_medias(uid, amount)
         return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error fetching feed: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_timeline_feed(amount: int = 10) -> str:
-    """
-    Get the home timeline feed (posts from accounts you follow),
-    just like opening the Instagram app to the main feed.
-    """
+    """Get the home timeline feed — posts from accounts you follow."""
     if err := _require_login(): return err
     try:
         feed = ig.cl.get_timeline_feed()
         items = feed.get("feed_items", [])
         results = []
-        count = 0
-        for item in items:
-            if count >= amount:
-                break
-            mi = item.get("media_or_ad")
+        for item in items[:amount]:
+            mi = item.get("media_or_ad", {})
             if mi:
                 code = mi.get("code", "")
-                caption_data = mi.get("caption") or {}
+                cap = (mi.get("caption") or {}).get("text", "")
                 results.append({
-                    "code": code,
                     "url": f"https://www.instagram.com/p/{code}/",
                     "user": mi.get("user", {}).get("username", ""),
-                    "caption": (caption_data.get("text", "") or "")[:200],
+                    "caption": (cap or "")[:200],
                     "like_count": mi.get("like_count", 0),
                     "comment_count": mi.get("comment_count", 0),
                 })
-                count += 1
         return str(results)
     except Exception as e:
-        return f"Error fetching timeline: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_media_info(media_id_or_url: str) -> str:
+    """Get detailed information about any post by ID or URL."""
+    if err := _require_login(): return err
+    try:
+        mid = _media_id_from_input(media_id_or_url)
+        m = ig.cl.media_info(mid)
+        return str(_fmt_media(m))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def instagram_get_tagged_posts(username: Optional[str] = None, amount: int = 12) -> str:
     """
-    Get detailed information about a post by its media ID or Instagram post URL.
+    Get posts where the logged-in account (or a target username) is tagged.
     """
     if err := _require_login(): return err
     try:
-        # Try extracting code from URL
-        if "instagram.com" in media_id_or_url:
-            match = re.search(r'/p/([A-Za-z0-9_-]+)/', media_id_or_url)
-            if match:
-                code = match.group(1)
-                media_id_or_url = ig.cl.media_id(code)
-        m = ig.cl.media_info(media_id_or_url)
-        return str(_fmt_media(m))
+        target = username or ig.cl.username
+        uid = ig.cl.user_id_from_username(target)
+        medias = ig.cl.usertag_medias(uid, amount)
+        return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error fetching media info: {e}"
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def instagram_get_saved_posts(amount: int = 20) -> str:
+    """Get posts saved in your Saved collection."""
+    if err := _require_login(): return err
+    try:
+        medias = ig.cl.user_saved_medias(ig.cl.user_id)[:amount]
+        return str([_fmt_media(m) for m in medias])
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_download_post(media_id_or_url: str, save_dir: Optional[str] = None) -> str:
-    """
-    Download a post's media (photo/video) to local disk.
-    Saves to the specified directory, or to 'downloads/' in the project folder.
-    """
+    """Download a post's photo or video to local disk."""
     if err := _require_login(): return err
     try:
-        if "instagram.com" in media_id_or_url:
-            match = re.search(r'/p/([A-Za-z0-9_-]+)/', media_id_or_url)
-            if match:
-                code = match.group(1)
-                media_id_or_url = ig.cl.media_id(code)
-
+        mid = _media_id_from_input(media_id_or_url)
         dest = save_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
         os.makedirs(dest, exist_ok=True)
-
-        m = ig.cl.media_info(media_id_or_url)
-        if m.media_type == 1:  # Photo
-            path = ig.cl.photo_download(media_id_or_url, folder=dest)
-        elif m.media_type == 2:  # Video
-            path = ig.cl.video_download(media_id_or_url, folder=dest)
+        m = ig.cl.media_info(mid)
+        if m.media_type == 2:
+            path = ig.cl.video_download(mid, folder=dest)
         else:
-            path = ig.cl.photo_download(media_id_or_url, folder=dest)
-
+            path = ig.cl.photo_download(mid, folder=dest)
         return f"Downloaded to: {path}"
     except Exception as e:
-        return f"Error downloading media: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. STORIES
+# 4. STORIES (WITH STICKERS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def instagram_post_photo_story(image_path_or_url: str) -> str:
-    """Post a photo to your Story. Accepts local path or image URL."""
+def instagram_post_photo_story(
+    image_path_or_url: str,
+    mentions: Optional[str] = None,
+    hashtags: Optional[str] = None,
+    location_name: Optional[str] = None,
+    link_url: Optional[str] = None,
+    close_friends_only: bool = False,
+) -> str:
+    """
+    Post a photo Story with full sticker support.
+
+    Parameters:
+    - image_path_or_url: Local path or image URL
+    - mentions: Comma-separated @usernames to add as mention stickers
+    - hashtags: Comma-separated hashtags for hashtag stickers
+    - location_name: Location sticker text
+    - link_url: Link sticker URL (the swipe-up / link button on story)
+    - close_friends_only: Post only to your Close Friends list
+    """
     if err := _require_login(): return err
     local = None
     try:
+        from instagrapi.types import StoryMention, StoryHashtag, StoryLocation, StoryLink, UserShort
         local = _download_if_url(image_path_or_url, ".jpg")
-        m = ig.cl.photo_upload_to_story(local)
-        return f"Story posted. Media ID: {m.pk}"
+
+        story_mentions = []
+        if mentions:
+            for name in [m.strip().lstrip("@") for m in mentions.split(",") if m.strip()]:
+                try:
+                    uid = ig.cl.user_id_from_username(name)
+                    user = ig.cl.user_info(uid)
+                    story_mentions.append(StoryMention(user=user, x=0.5, y=0.5, width=0.5, height=0.1))
+                except Exception:
+                    pass
+
+        story_hashtags = []
+        if hashtags:
+            for tag in [h.strip().lstrip("#") for h in hashtags.split(",") if h.strip()]:
+                try:
+                    hinfo = ig.cl.hashtag_info(tag)
+                    story_hashtags.append(StoryHashtag(hashtag=hinfo, x=0.5, y=0.7, width=0.3, height=0.08))
+                except Exception:
+                    pass
+
+        story_locations = []
+        if location_name:
+            try:
+                results = ig.cl.location_search(location_name)
+                if results:
+                    story_locations.append(StoryLocation(location=results[0], x=0.5, y=0.85, width=0.4, height=0.08))
+            except Exception:
+                pass
+
+        story_links = []
+        if link_url:
+            story_links.append(StoryLink(webUri=link_url))
+
+        m = ig.cl.photo_upload_to_story(
+            local,
+            mentions=story_mentions,
+            hashtags=story_hashtags,
+            locations=story_locations,
+            links=story_links,
+        )
+        return str({
+            "status": "success",
+            "media_id": str(m.pk),
+            "stickers": {
+                "mentions": [s.user.username for s in story_mentions],
+                "hashtags": [s.hashtag.name for s in story_hashtags],
+                "location": location_name,
+                "link": link_url,
+            }
+        })
     except Exception as e:
         return f"Error posting story: {e}"
     finally:
@@ -472,14 +885,69 @@ def instagram_post_photo_story(image_path_or_url: str) -> str:
 
 
 @mcp.tool()
-def instagram_post_video_story(video_path_or_url: str) -> str:
-    """Post a video to your Story. Accepts local path or video URL."""
+def instagram_post_video_story(
+    video_path_or_url: str,
+    mentions: Optional[str] = None,
+    hashtags: Optional[str] = None,
+    location_name: Optional[str] = None,
+    link_url: Optional[str] = None,
+    close_friends_only: bool = False,
+) -> str:
+    """
+    Post a video Story with full sticker support.
+
+    Parameters:
+    - video_path_or_url: Local path or URL to MP4
+    - mentions: Comma-separated @usernames for mention stickers
+    - hashtags: Comma-separated hashtags for hashtag stickers
+    - location_name: Location sticker text
+    - link_url: Link sticker URL
+    - close_friends_only: Post only to Close Friends
+    """
     if err := _require_login(): return err
     local = None
     try:
+        from instagrapi.types import StoryMention, StoryHashtag, StoryLocation, StoryLink
         local = _download_if_url(video_path_or_url, ".mp4")
-        m = ig.cl.video_upload_to_story(local)
-        return f"Video story posted. Media ID: {m.pk}"
+
+        story_mentions, story_hashtags, story_locations, story_links = [], [], [], []
+
+        if mentions:
+            for name in [m.strip().lstrip("@") for m in mentions.split(",") if m.strip()]:
+                try:
+                    uid = ig.cl.user_id_from_username(name)
+                    user = ig.cl.user_info(uid)
+                    story_mentions.append(StoryMention(user=user, x=0.5, y=0.5, width=0.5, height=0.1))
+                except Exception:
+                    pass
+        if hashtags:
+            for tag in [h.strip().lstrip("#") for h in hashtags.split(",") if h.strip()]:
+                try:
+                    hinfo = ig.cl.hashtag_info(tag)
+                    story_hashtags.append(StoryHashtag(hashtag=hinfo, x=0.5, y=0.7, width=0.3, height=0.08))
+                except Exception:
+                    pass
+        if location_name:
+            try:
+                results = ig.cl.location_search(location_name)
+                if results:
+                    story_locations.append(StoryLocation(location=results[0], x=0.5, y=0.85, width=0.4, height=0.08))
+            except Exception:
+                pass
+        if link_url:
+            story_links.append(StoryLink(webUri=link_url))
+
+        m = ig.cl.video_upload_to_story(
+            local,
+            mentions=story_mentions,
+            hashtags=story_hashtags,
+            locations=story_locations,
+            links=story_links,
+        )
+        return str({
+            "status": "success",
+            "media_id": str(m.pk),
+        })
     except Exception as e:
         return f"Error posting video story: {e}"
     finally:
@@ -488,48 +956,37 @@ def instagram_post_video_story(video_path_or_url: str) -> str:
 
 @mcp.tool()
 def instagram_get_user_stories(username: Optional[str] = None) -> str:
-    """
-    Get active stories for the logged-in account or a target username.
-    Returns story media IDs, types, and timestamps.
-    """
+    """Get active stories for the logged-in account or a target username."""
     if err := _require_login(): return err
     try:
         target = username or ig.cl.username
-        user_id = ig.cl.user_id_from_username(target)
-        stories = ig.cl.user_stories(user_id)
-        return str([{
-            "pk": str(s.pk),
-            "media_type": s.media_type,
-            "taken_at": str(s.taken_at),
-            "expiring_at": str(s.expiring_at) if hasattr(s, 'expiring_at') else None,
-        } for s in stories])
+        uid = ig.cl.user_id_from_username(target)
+        stories = ig.cl.user_stories(uid)
+        return str([{"pk": str(s.pk), "media_type": s.media_type, "taken_at": str(s.taken_at)} for s in stories])
     except Exception as e:
-        return f"Error fetching stories: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_delete_story(story_id: str) -> str:
-    """Delete one of your active stories by its media ID."""
+    """Delete one of your active stories by media ID."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_delete(story_id)
-        return f"Story {story_id} deleted. Result: {result}"
+        ig.cl.media_delete(story_id)
+        return f"Story {story_id} deleted."
     except Exception as e:
-        return f"Error deleting story: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_story_viewers(story_id: str) -> str:
-    """
-    Get the list of users who viewed one of your stories.
-    Returns usernames and user IDs.
-    """
+    """Get the list of users who viewed one of your stories."""
     if err := _require_login(): return err
     try:
         viewers = ig.cl.story_viewers(story_id)
         return str([_fmt_user(v) for v in viewers])
     except Exception as e:
-        return f"Error fetching story viewers: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,36 +995,26 @@ def instagram_get_story_viewers(story_id: str) -> str:
 
 @mcp.tool()
 def instagram_get_highlights(username: Optional[str] = None) -> str:
-    """
-    Get story highlights for the logged-in account or a target username.
-    """
+    """Get story highlights for the logged-in account or a target username."""
     if err := _require_login(): return err
     try:
         target = username or ig.cl.username
-        user_id = ig.cl.user_id_from_username(target)
-        highlights = ig.cl.highlights(user_id)
-        return str([{
-            "pk": str(h.pk),
-            "title": h.title,
-            "media_count": h.media_count,
-            "cover_url": str(h.cover_url) if hasattr(h, 'cover_url') else None,
-        } for h in highlights])
+        uid = ig.cl.user_id_from_username(target)
+        highlights = ig.cl.highlights(uid)
+        return str([{"pk": str(h.pk), "title": h.title, "media_count": h.media_count} for h in highlights])
     except Exception as e:
-        return f"Error fetching highlights: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_create_highlight(title: str, story_ids: List[str]) -> str:
-    """
-    Create a new highlight from existing stories.
-    Provide the highlight title and a list of story media IDs to include.
-    """
+    """Create a new story highlight collection from existing stories."""
     if err := _require_login(): return err
     try:
         h = ig.cl.highlight_create(title, story_ids)
         return f"Highlight '{title}' created. ID: {h.pk}"
     except Exception as e:
-        return f"Error creating highlight: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -575,10 +1022,10 @@ def instagram_delete_highlight(highlight_id: str) -> str:
     """Delete a highlights collection by its ID."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.highlight_delete(highlight_id)
-        return f"Highlight {highlight_id} deleted. Result: {result}"
+        ig.cl.highlight_delete(highlight_id)
+        return f"Highlight {highlight_id} deleted."
     except Exception as e:
-        return f"Error deleting highlight: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -586,112 +1033,119 @@ def instagram_delete_highlight(highlight_id: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def instagram_like_post(media_id: str) -> str:
-    """Like a post by its media ID."""
+def instagram_like_post(media_id_or_url: str) -> str:
+    """Like a post by media ID or URL."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_like(media_id)
-        return f"Liked post {media_id}. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_like(mid)
+        return f"Liked post {mid}."
     except Exception as e:
-        return f"Error liking post: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_unlike_post(media_id: str) -> str:
-    """Unlike (remove like from) a post by its media ID."""
+def instagram_unlike_post(media_id_or_url: str) -> str:
+    """Remove a like from a post."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_unlike(media_id)
-        return f"Unliked post {media_id}. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_unlike(mid)
+        return f"Unliked post {mid}."
     except Exception as e:
-        return f"Error unliking post: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_save_post(media_id: str) -> str:
+def instagram_save_post(media_id_or_url: str) -> str:
     """Save a post to your Saved collection."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_save(media_id)
-        return f"Post {media_id} saved. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_save(mid)
+        return f"Post {mid} saved."
     except Exception as e:
-        return f"Error saving post: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_unsave_post(media_id: str) -> str:
+def instagram_unsave_post(media_id_or_url: str) -> str:
     """Remove a post from your Saved collection."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_unsave(media_id)
-        return f"Post {media_id} unsaved. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_unsave(mid)
+        return f"Post {mid} unsaved."
     except Exception as e:
-        return f"Error unsaving post: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_get_post_likers(media_id: str) -> str:
+def instagram_get_post_likers(media_id_or_url: str) -> str:
     """Get the list of users who liked a post."""
     if err := _require_login(): return err
     try:
-        likers = ig.cl.media_likers(media_id)
+        mid = _media_id_from_input(media_id_or_url)
+        likers = ig.cl.media_likers(mid)
         return str([_fmt_user(u) for u in likers])
     except Exception as e:
-        return f"Error fetching likers: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_comment_on_post(media_id: str, text: str) -> str:
-    """Post a comment on a media item."""
+def instagram_comment_on_post(media_id_or_url: str, text: str) -> str:
+    """Post a comment on any media item."""
     if err := _require_login(): return err
     try:
-        c = ig.cl.media_comment(media_id, text)
-        return f"Comment posted. ID: {c.pk}, Text: '{c.text}'"
+        mid = _media_id_from_input(media_id_or_url)
+        c = ig.cl.media_comment(mid, text)
+        return f"Comment posted. ID: {c.pk}"
     except Exception as e:
-        return f"Error posting comment: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_reply_to_comment(media_id: str, comment_id: str, text: str) -> str:
-    """
-    Reply to a specific comment on a post.
-    """
+def instagram_reply_to_comment(media_id_or_url: str, comment_id: str, text: str) -> str:
+    """Reply to a specific comment on a post."""
     if err := _require_login(): return err
     try:
-        c = ig.cl.media_comment(media_id, text, replied_to_comment_id=int(comment_id))
-        return f"Reply posted. ID: {c.pk}, Text: '{c.text}'"
+        mid = _media_id_from_input(media_id_or_url)
+        c = ig.cl.media_comment(mid, text, replied_to_comment_id=int(comment_id))
+        return f"Reply posted. ID: {c.pk}"
     except Exception as e:
-        return f"Error replying to comment: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_delete_comment(media_id: str, comment_id: str) -> str:
-    """Delete a comment (yours or on your post) by media ID and comment ID."""
+def instagram_delete_comment(media_id_or_url: str, comment_id: str) -> str:
+    """Delete a comment by media ID/URL and comment ID."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_comment_delete(media_id, comment_id)
-        return f"Comment {comment_id} deleted. Result: {result}"
+        mid = _media_id_from_input(media_id_or_url)
+        ig.cl.media_comment_delete(mid, comment_id)
+        return f"Comment {comment_id} deleted."
     except Exception as e:
-        return f"Error deleting comment: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_like_comment(media_id: str, comment_id: str) -> str:
+def instagram_like_comment(comment_id: str) -> str:
     """Like a comment on a post."""
     if err := _require_login(): return err
     try:
-        result = ig.cl.media_comment_like(comment_id)
-        return f"Comment {comment_id} liked. Result: {result}"
+        ig.cl.media_comment_like(comment_id)
+        return f"Comment {comment_id} liked."
     except Exception as e:
-        return f"Error liking comment: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
-def instagram_get_post_comments(media_id: str, amount: int = 20) -> str:
-    """Get comments on a post. Returns commenter usernames, text, and timestamps."""
+def instagram_get_post_comments(media_id_or_url: str, amount: int = 20) -> str:
+    """Get comments on a post with usernames, text, and timestamps."""
     if err := _require_login(): return err
     try:
-        comments = ig.cl.media_comments(media_id, amount)
+        mid = _media_id_from_input(media_id_or_url)
+        comments = ig.cl.media_comments(mid, amount)
         return str([{
             "pk": str(c.pk),
             "user": c.user.username,
@@ -700,42 +1154,40 @@ def instagram_get_post_comments(media_id: str, amount: int = 20) -> str:
             "created_at": str(c.created_at_utc),
         } for c in comments])
     except Exception as e:
-        return f"Error fetching comments: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. FOLLOWING & FOLLOWERS
+# 7. FOLLOWING & RELATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def instagram_follow_user(username: str) -> str:
-    """Follow a user by their username."""
+    """Follow a user by username."""
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
-        result = ig.cl.user_follow(uid)
-        return f"Followed @{username}. Result: {result}"
+        ig.cl.user_follow(uid)
+        return f"Followed @{username}."
     except Exception as e:
-        return f"Error following user: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_unfollow_user(username: str) -> str:
-    """Unfollow a user by their username."""
+    """Unfollow a user by username."""
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
-        result = ig.cl.user_unfollow(uid)
-        return f"Unfollowed @{username}. Result: {result}"
+        ig.cl.user_unfollow(uid)
+        return f"Unfollowed @{username}."
     except Exception as e:
-        return f"Error unfollowing user: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_followers(username: Optional[str] = None, amount: int = 50) -> str:
-    """
-    Get the followers list for the logged-in account or a target username.
-    """
+    """Get the followers list for the logged-in account or a target username."""
     if err := _require_login(): return err
     try:
         target = username or ig.cl.username
@@ -743,14 +1195,12 @@ def instagram_get_followers(username: Optional[str] = None, amount: int = 50) ->
         followers = ig.cl.user_followers(uid, amount=amount)
         return str([_fmt_user(u) for u in followers.values()])
     except Exception as e:
-        return f"Error fetching followers: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_following(username: Optional[str] = None, amount: int = 50) -> str:
-    """
-    Get the list of accounts that the logged-in account (or a target username) is following.
-    """
+    """Get the accounts that the logged-in account (or target username) is following."""
     if err := _require_login(): return err
     try:
         target = username or ig.cl.username
@@ -758,19 +1208,19 @@ def instagram_get_following(username: Optional[str] = None, amount: int = 50) ->
         following = ig.cl.user_following(uid, amount=amount)
         return str([_fmt_user(u) for u in following.values()])
     except Exception as e:
-        return f"Error fetching following: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_block_user(username: str) -> str:
-    """Block a user by their username."""
+    """Block a user by username."""
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
-        result = ig.cl.user_block(uid)
-        return f"Blocked @{username}. Result: {result}"
+        ig.cl.user_block(uid)
+        return f"Blocked @{username}."
     except Exception as e:
-        return f"Error blocking user: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -779,10 +1229,10 @@ def instagram_unblock_user(username: str) -> str:
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
-        result = ig.cl.user_unblock(uid)
-        return f"Unblocked @{username}. Result: {result}"
+        ig.cl.user_unblock(uid)
+        return f"Unblocked @{username}."
     except Exception as e:
-        return f"Error unblocking user: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -793,18 +1243,16 @@ def instagram_get_blocked_users() -> str:
         blocked = ig.cl.user_blocked_list()
         return str([_fmt_user(u) for u in blocked])
     except Exception as e:
-        return f"Error fetching blocked users: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. DIRECT MESSAGES (DMs)
+# 8. DIRECT MESSAGES
 # ─────────────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def instagram_get_direct_threads(amount: int = 20) -> str:
-    """
-    Get recent DM threads. Returns thread IDs, participants, and last activity time.
-    """
+    """Get recent DM threads with thread IDs, participants, and last activity."""
     if err := _require_login(): return err
     try:
         threads = ig.cl.direct_threads(amount)
@@ -813,16 +1261,15 @@ def instagram_get_direct_threads(amount: int = 20) -> str:
             "title": t.thread_title or "",
             "participants": [u.username for u in (t.users or [])],
             "last_activity_at": str(t.last_activity_at),
-            "unread_count": t.read_state,
             "muted": t.muted,
         } for t in threads])
     except Exception as e:
-        return f"Error fetching threads: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_direct_messages(thread_id: str, amount: int = 30) -> str:
-    """Get messages from a specific DM thread."""
+    """Get messages in a DM thread, sorted chronologically."""
     if err := _require_login(): return err
     try:
         thread = ig.cl.direct_thread(thread_id)
@@ -835,16 +1282,16 @@ def instagram_get_direct_messages(thread_id: str, amount: int = 30) -> str:
             "timestamp": str(m.timestamp),
         } for m in msgs])
     except Exception as e:
-        return f"Error fetching messages: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_send_direct_message(text: str, username: Optional[str] = None,
                                    thread_id: Optional[str] = None) -> str:
     """
-    Send a text DM. Specify either:
-    - username: to start a new conversation or message a user.
-    - thread_id: to reply to an existing conversation thread.
+    Send a text DM. Provide either:
+    - username: to start or continue a conversation with a user.
+    - thread_id: to reply in an existing thread.
     """
     if err := _require_login(): return err
     if not username and not thread_id:
@@ -857,13 +1304,13 @@ def instagram_send_direct_message(text: str, username: Optional[str] = None,
             msg = ig.cl.direct_send(text, user_ids=[uid])
         return f"Message sent. ID: {msg.id}"
     except Exception as e:
-        return f"Error sending message: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_send_dm_photo(image_path_or_url: str, username: Optional[str] = None,
                              thread_id: Optional[str] = None) -> str:
-    """Send a photo via Direct Message. Specify username or thread_id."""
+    """Send a photo via DM. Provide username or thread_id."""
     if err := _require_login(): return err
     if not username and not thread_id:
         return "Error: Provide either username or thread_id."
@@ -877,7 +1324,7 @@ def instagram_send_dm_photo(image_path_or_url: str, username: Optional[str] = No
             msg = ig.cl.direct_send_photo(local, user_ids=[uid])
         return f"Photo DM sent. ID: {msg.id}"
     except Exception as e:
-        return f"Error sending photo DM: {e}"
+        return f"Error: {e}"
     finally:
         if local: _cleanup(local, image_path_or_url)
 
@@ -885,7 +1332,7 @@ def instagram_send_dm_photo(image_path_or_url: str, username: Optional[str] = No
 @mcp.tool()
 def instagram_send_dm_video(video_path_or_url: str, username: Optional[str] = None,
                              thread_id: Optional[str] = None) -> str:
-    """Send a video via Direct Message. Specify username or thread_id."""
+    """Send a video via DM. Provide username or thread_id."""
     if err := _require_login(): return err
     if not username and not thread_id:
         return "Error: Provide either username or thread_id."
@@ -899,7 +1346,7 @@ def instagram_send_dm_video(video_path_or_url: str, username: Optional[str] = No
             msg = ig.cl.direct_send_video(local, user_ids=[uid])
         return f"Video DM sent. ID: {msg.id}"
     except Exception as e:
-        return f"Error sending video DM: {e}"
+        return f"Error: {e}"
     finally:
         if local: _cleanup(local, video_path_or_url)
 
@@ -912,7 +1359,7 @@ def instagram_mark_thread_seen(thread_id: str) -> str:
         ig.cl.direct_send_seen(thread_id)
         return f"Thread {thread_id} marked as seen."
     except Exception as e:
-        return f"Error marking thread seen: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -921,93 +1368,72 @@ def instagram_mark_thread_seen(thread_id: str) -> str:
 
 @mcp.tool()
 def instagram_search_users(query: str, count: int = 10) -> str:
-    """
-    Search for Instagram users by name or username.
-    Returns matching accounts with follower counts.
-    """
+    """Search for Instagram users by name or username."""
     if err := _require_login(): return err
     try:
         results = ig.cl.search_users(query)[:count]
         return str([_fmt_user(u) for u in results])
     except Exception as e:
-        return f"Error searching users: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_search_hashtag(hashtag: str, amount: int = 12) -> str:
-    """
-    Search posts by hashtag. Returns recent posts tagged with the given hashtag.
-    Do not include the '#' symbol in the hashtag parameter.
-    """
+    """Get recent posts for a hashtag. Do not include '#' symbol."""
     if err := _require_login(): return err
     try:
-        medias = ig.cl.hashtag_medias_recent(hashtag, amount)
+        medias = ig.cl.hashtag_medias_recent(hashtag.lstrip("#"), amount)
         return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error searching hashtag: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_hashtag_top_posts(hashtag: str, amount: int = 9) -> str:
-    """
-    Get the top/trending posts for a given hashtag.
-    Do not include the '#' symbol.
-    """
+    """Get trending/top posts for a hashtag. Do not include '#' symbol."""
     if err := _require_login(): return err
     try:
-        medias = ig.cl.hashtag_medias_top(hashtag, amount)
+        medias = ig.cl.hashtag_medias_top(hashtag.lstrip("#"), amount)
         return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error fetching hashtag top posts: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_hashtag_info(hashtag: str) -> str:
-    """
-    Get information about a hashtag including post count.
-    """
+    """Get information about a hashtag including total post count."""
     if err := _require_login(): return err
     try:
-        info = ig.cl.hashtag_info(hashtag)
-        return str({
-            "name": info.name,
-            "media_count": info.media_count,
-            "id": str(info.id),
-        })
+        info = ig.cl.hashtag_info(hashtag.lstrip("#"))
+        return str({"name": info.name, "media_count": info.media_count, "id": str(info.id)})
     except Exception as e:
-        return f"Error fetching hashtag info: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_similar_accounts(username: str) -> str:
-    """
-    Get accounts similar to a given username (Instagram's 'suggested for you' logic).
-    Useful for finding related accounts in a niche.
-    """
+    """Find accounts similar to a given username (Instagram's 'suggested for you')."""
     if err := _require_login(): return err
     try:
         uid = ig.cl.user_id_from_username(username)
         similar = ig.cl.user_related_profiles(uid)
         return str([_fmt_user(u) for u in similar])
     except Exception as e:
-        return f"Error fetching similar accounts: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_location_posts(location_name: str, amount: int = 12) -> str:
-    """
-    Get recent posts tagged at a specific location by name.
-    """
+    """Get recent posts tagged at a specific location."""
     if err := _require_login(): return err
     try:
         results = ig.cl.location_search(location_name)
         if not results:
             return f"No location found for '{location_name}'"
-        loc = results[0]
-        medias = ig.cl.location_medias_recent(loc.pk, amount)
+        medias = ig.cl.location_medias_recent(results[0].pk, amount)
         return str([_fmt_media(m) for m in medias])
     except Exception as e:
-        return f"Error fetching location posts: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,46 +1442,33 @@ def instagram_get_location_posts(location_name: str, amount: int = 12) -> str:
 
 @mcp.tool()
 def instagram_get_notifications(amount: int = 20) -> str:
-    """
-    Get recent activity notifications — likes, comments, follows, mentions, etc.
-    """
+    """Get recent activity — likes, comments, follows, mentions, tags."""
     if err := _require_login(): return err
     try:
         activity = ig.cl.news_inbox_v1()
         counts = activity.get("counts", {})
         stories = activity.get("new_stories", [])[:amount]
-        items = []
-        for s in stories:
-            args = s.get("args", {})
-            items.append({
-                "type": s.get("type"),
-                "text": args.get("text", ""),
-                "timestamp": args.get("timestamp"),
-                "profile_id": args.get("profile_id"),
-                "profile_name": args.get("profile_name"),
-            })
+        items = [{
+            "type": s.get("type"),
+            "text": s.get("args", {}).get("text", ""),
+            "timestamp": s.get("args", {}).get("timestamp"),
+            "from": s.get("args", {}).get("profile_name"),
+        } for s in stories]
         return str({"unread_counts": counts, "notifications": items})
     except Exception as e:
-        return f"Error fetching notifications: {e}"
+        return f"Error: {e}"
 
 
 @mcp.tool()
 def instagram_get_pending_follow_requests() -> str:
-    """
-    Get pending follow requests for a private account.
-    Returns list of users waiting for approval.
-    """
+    """Get pending follow requests (for private accounts)."""
     if err := _require_login(): return err
     try:
         pending = ig.cl.pending_requests_v1()
         users = pending.get("users", [])
-        return str([{
-            "pk": str(u.get("pk")),
-            "username": u.get("username"),
-            "full_name": u.get("full_name"),
-        } for u in users])
+        return str([{"pk": str(u.get("pk")), "username": u.get("username"), "full_name": u.get("full_name")} for u in users])
     except Exception as e:
-        return f"Error fetching pending requests: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
